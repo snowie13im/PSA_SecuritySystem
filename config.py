@@ -25,7 +25,7 @@ IMG_SIZE = (200, 200)
 # Any prediction with distance BELOW this value is accepted as recognised.
 # Decrease to be stricter (fewer false positives, more unknowns).
 # Increase to be more lenient (more matches, higher false-positive risk).
-CONFIDENCE_MAX = 80
+CONFIDENCE_MAX = 60
 
 # Seconds that must pass before a new "unknown face" alert is allowed to fire.
 # Prevents the registration pop-up from re-opening while a stranger
@@ -35,7 +35,7 @@ ALERT_COOLDOWN = 5
 # Haar-cascade ignores any face bounding box smaller than this (pixels).
 # Filters out tiny, distant, or partially visible faces that would give
 # poor recognition results anyway.
-FACE_SIZE_MIN = 60
+FACE_SIZE_MIN = 80
 
 # ── Registration poses ─────────────────────────────────────────────────────
 

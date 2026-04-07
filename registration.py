@@ -11,6 +11,7 @@ from config import (
     IMG_SIZE, FACE_SIZE_MIN, POSES,
     face_cascade,
 )
+from theme_song import ask_and_save_theme
 
 
 #  THREAD-SAFE FRAME SHARING
@@ -427,6 +428,9 @@ def registration_thread(cap, names: dict, recogniser_ref: list) -> None:
                         recogniser_ref[0] = new_rec
 
                     print(f"  [OK] '{name_input}' registered with ID {uid}!")
+
+                    # Perguntar se o utilizador quer uma theme song
+                    ask_and_save_theme(uid, name_input)
             else:
                 print("  [!] Empty name — registration cancelled.")
 

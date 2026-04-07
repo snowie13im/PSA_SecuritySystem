@@ -21,6 +21,7 @@ from registration import (
     registration_thread,    # the background worker function
     train_model,            # used after delete to retrain / remove model
 )
+from theme_song import play_theme_for, list_music_requests, mark_request_done
 
 
 #  PERSISTENCE HELPERS  (read-only from this module's perspective)
@@ -153,6 +154,8 @@ def management_menu() -> bool:
         "2": "List registered people",
         "3": "Delete a person",
         "4": "Delete everything",
+        "5": "Ver pedidos de musica",
+        "6": "Marcar pedido como resolvido",
         "0": "Quit",
     }
     while True:
@@ -169,6 +172,8 @@ def management_menu() -> bool:
         elif choice == "2": list_people()
         elif choice == "3": delete_person()
         elif choice == "4": delete_all()
+        elif choice == "5": list_music_requests()
+        elif choice == "6": mark_request_done()
         elif choice == "0": return False
         else: print("  [!] Invalid option.")
 
@@ -260,6 +265,7 @@ def main() -> None:
                 label        = names.get(str(label_id), "?")
                 color        = (0, 200, 0)    # green
                 alert_active = False          # reset so future unknowns alert again
+                play_theme_for(label_id)      # toca a theme song (non-blocking)
             else:
                 label = "UNKNOWN"
                 color = (0, 0, 220)           # red
