@@ -3,31 +3,7 @@ from __future__ import annotations
 """
 theme_song.py
 =============
-Módulo de theme songs por pessoa
-
-Responsabilidades
------------------
-- Listar as músicas disponíveis na pasta AUDIO_DIR.
-- Perguntar ao utilizador (dentro de uma janela OpenCV) se quer associar
-  uma música ao seu registo.
-- Guardar / carregar o mapeamento  uid → ficheiro de áudio  num JSON.
-- Tocar a tema da pessoa quando ela é reconhecida, sem bloquear o loop
-  principal (thread dedicada) e com protecção contra crashes por
-  biblioteca em falta ou ficheiro corrompido.
-- Registar pedidos de música feitos pelos utilizadores para o admin ver.
-
-Dependências externas opcionais
---------------------------------
-pygame   — reprodução de áudio (instalável com  pip install pygame)
-Se pygame não estiver instalado o módulo funciona silenciosamente —
-todas as funções de reprodução ficam no-ops e é impresso um aviso
-único no arranque.
-
-Estrutura de ficheiros
-----------------------
-audios/                   ← pasta com os ficheiros de áudio (.mp3 / .wav / .ogg)
-theme_songs.json          ← { "0": "audios/eye_of_the_tiger.mp3", "3": "..." }
-music_requests.json       ← [ {"uid": 2, "name": "Alice", "request": "..."}, ... ]
+Módulo de theme songs por pessoa.
 """
 
 import os
@@ -37,14 +13,11 @@ import time
 
 # ── Configuração ────────────────────────────────────────────────────────────
 
-AUDIO_DIR          = "audios"                # pasta com ficheiros de áudio
-THEME_FILE         = "theme_songs.json"      # mapa uid → caminho do áudio
-REQUESTS_FILE      = "music_requests.json"   # pedidos pendentes para o admin
-SUPPORTED_EXT      = (".mp3", ".wav", ".ogg", ".flac")
-
-# Segundos mínimos entre dois plays da mesma (ou diferente) música.
-# Evita que a música recomece a cada frame enquanto a pessoa está no ecrã.
-PLAY_COOLDOWN      = 15
+AUDIO_DIR      = "audios"
+THEME_FILE     = "theme_songs.json"
+REQUESTS_FILE  = "music_requests.json"
+SUPPORTED_EXT  = (".mp3", ".wav", ".ogg", ".flac")
+PLAY_COOLDOWN  = 15
 
 # ── Detecção opcional do pygame ─────────────────────────────────────────────
 
@@ -57,11 +30,17 @@ except Exception as _e:
     print(f"[theme_song] pygame não disponível ({_e}). "
           "As theme songs não serão reproduzidas.")
 
-# ── Estado de reprodução (partilhado entre threads) ─────────────────────────
+# ── Estado de reprodução ────────────────────────────────────────────────────
 
-_play_lock      = threading.Lock()
-_last_played_uid: "int | None" = None   # uid da última pessoa cujo tema tocou
-_last_play_time: float       = 0.0    # timestamp do último play
+_play_lock       = threading.Lock()
+_last_played_uid: "int | None" = None
+_last_play_time:  float        = 0.0
+
+# ── FIX: In-memory theme cache — avoids re-reading the JSON file every frame.
+# play_theme_for() is called on every recognised face at ~30 fps; without
+# this cache that means 30 disk reads per second per recognised person.
+_themes_cache:      "dict | None" = None
+_themes_cache_mtime: float        = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,35 +48,61 @@ _last_play_time: float       = 0.0    # timestamp do último play
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _load_themes() -> dict:
-    """Carrega o mapeamento uid (str) → caminho do áudio."""
-    if os.path.exists(THEME_FILE):
-        try:
-            return json.load(open(THEME_FILE, encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    """
+    Return the uid→audio-path mapping.
+    Re-reads from disk only when the file has been modified since the last
+    read; otherwise returns the in-memory cache (O(1), no I/O).
+    """
+    global _themes_cache, _themes_cache_mtime
+
+    if not os.path.exists(THEME_FILE):
+        return {}
+
+    try:
+        mtime = os.path.getmtime(THEME_FILE)
+    except OSError:
+        return _themes_cache or {}
+
+    # Cache is still fresh — skip the disk read entirely
+    if _themes_cache is not None and mtime == _themes_cache_mtime:
+        return _themes_cache
+
+    # File changed (or first load) — reload and update cache
+    try:
+        with open(THEME_FILE, encoding="utf-8") as fh:
+            _themes_cache       = json.load(fh)
+            _themes_cache_mtime = mtime
+    except Exception:
+        _themes_cache = _themes_cache or {}
+
+    return _themes_cache
 
 
 def _save_themes(themes: dict) -> None:
-    """Persiste o mapeamento de temas."""
-    json.dump(themes, open(THEME_FILE, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    # FIX: use 'with' so the file handle is always closed, even on error
+    with open(THEME_FILE, "w", encoding="utf-8") as fh:
+        json.dump(themes, fh, ensure_ascii=False, indent=2)
+
+    # Invalidate cache so the next read picks up the new file
+    global _themes_cache, _themes_cache_mtime
+    _themes_cache       = themes.copy()
+    _themes_cache_mtime = os.path.getmtime(THEME_FILE)
 
 
 def _load_requests() -> list:
-    """Carrega a lista de pedidos de música pendentes."""
-    if os.path.exists(REQUESTS_FILE):
-        try:
-            return json.load(open(REQUESTS_FILE, encoding="utf-8"))
-        except Exception:
-            pass
-    return []
+    if not os.path.exists(REQUESTS_FILE):
+        return []
+    try:
+        # FIX: use 'with' for proper file-handle cleanup
+        with open(REQUESTS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return []
 
 
 def _save_requests(requests: list) -> None:
-    """Persiste os pedidos de música."""
-    json.dump(requests, open(REQUESTS_FILE, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    with open(REQUESTS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(requests, fh, ensure_ascii=False, indent=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,12 +110,9 @@ def _save_requests(requests: list) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def list_audio_files() -> list[str]:
-    """
-    Devolve a lista de caminhos completos dos ficheiros de áudio em AUDIO_DIR.
-    Cria a pasta se não existir.
-    """
+    """Return sorted list of audio file paths in AUDIO_DIR."""
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    files = [
+    files= [
         os.path.join(AUDIO_DIR, f)
         for f in sorted(os.listdir(AUDIO_DIR))
         if f.lower().endswith(SUPPORTED_EXT)
@@ -123,57 +125,43 @@ def list_audio_files() -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ask_theme_in_window(person_name: str) -> str | None:
-    """
-    Mostra uma janela OpenCV para o utilizador escolher uma theme song.
-
-    Fluxo
-    -----
-    1. Pergunta Y / N se quer música.
-    2. Se Y → mostra lista numerada de músicas disponíveis.
-       - Digita o número e confirma com ENTER.
-       - Ou pressiona R para fazer um pedido de música ao admin.
-    3. Se N → devolve None (sem música).
-    4. Se a pasta estiver vazia, vai directamente para o pedido.
-
-    Devolve
-    -------
-    Caminho do ficheiro escolhido, a string especial ``"REQUEST"``
-    se o utilizador quer fazer um pedido, ou ``None`` se não quer música.
-    """
     try:
         import cv2
         import numpy as np
     except ImportError:
-        return None  # sem cv2, não mostramos janela
+        return None
 
     WIN = "Theme Song"
-    W, H = 480, 380
-    BG       = (20,  20,  20)
-    CYAN     = (0,  200, 255)
-    WHITE    = (255, 255, 255)
-    GREY     = (160, 160, 160)
-    GREEN    = (0,  220,   0)
-    YELLOW   = (0,  220, 220)
+    W, H   = 480, 380
+    BG     = (20,  20,  20)
+    CYAN   = (0,  200, 255)
+    WHITE  = (255, 255, 255)
+    GREY   = (160, 160, 160)
+    GREEN  = (0,  220,   0)
+    YELLOW = (0,  220, 220)
 
     audio_files = list_audio_files()
 
-    # ── Fase 1: queres música? ────────────────────────────────────────────────
-    while True:
-        panel = np.zeros((H, W, 3), dtype=np.uint8)
-        panel[:] = BG
+    # Drain any keys that were buffered during the registration flow
+    # (e.g. the SPACE from the last photo capture) so they don't
+    # accidentally dismiss this window before the user sees it.
+    for _ in range(5):
+        cv2.waitKey(1)
 
+    # Phase 1: does the user want a theme song?
+    while True:
+        panel = np.full((H, W, 3), BG, dtype=np.uint8)
         cv2.putText(panel, f"Theme song para {person_name}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, CYAN, 2)
         cv2.line(panel, (20, 48), (W - 20, 48), GREY, 1)
         cv2.putText(panel, "Queres associar uma musica?",
                     (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 1)
-        cv2.putText(panel, "Y = Sim    N = Nao (ENTER / ESC)",
+        cv2.putText(panel, "Y = Sim    N = Nao    ESC = cancelar",
                     (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.55, GREY, 1)
-
         cv2.imshow(WIN, panel)
-        key = cv2.waitKey(30) & 0xFF
 
-        if key in (ord('n'), 27):   # N ou ESC → sem música
+        key = cv2.waitKey(30) & 0xFF
+        if key in (ord('n'), 27):   # só N ou ESC cancelam — ENTER já não cancela
             cv2.destroyWindow(WIN)
             return None
         if key == ord('y'):
@@ -182,33 +170,28 @@ def _ask_theme_in_window(person_name: str) -> str | None:
             cv2.destroyWindow(WIN)
             return None
 
-    # ── Fase 2: selecção da música (ou pedido) ────────────────────────────────
+    # Phase 2: select a song or make a request
     if not audio_files:
-        # Sem ficheiros disponíveis — ir directamente para pedido
         return _ask_music_request_in_window(WIN, person_name, W, H,
                                             BG, CYAN, WHITE, GREY, YELLOW)
 
-    typed    = ""
-    selected = None
-    # Quantas músicas cabem visualmente (máx 8 linhas)
+    typed       = ""
+    selected    = None
     MAX_VISIBLE = min(len(audio_files), 8)
 
     while selected is None:
-        panel = np.zeros((H, W, 3), dtype=np.uint8)
-        panel[:] = BG
+        panel = np.full((H, W, 3), BG, dtype=np.uint8)
 
         cv2.putText(panel, "Escolhe uma musica (numero + ENTER):",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, CYAN, 1)
 
         for idx, path in enumerate(audio_files[:MAX_VISIBLE]):
-            label  = f"{idx + 1}. {os.path.basename(path)}"
-            # trunca para caber na janela
+            label = f"{idx + 1}. {os.path.basename(path)}"
             if len(label) > 52:
                 label = label[:49] + "..."
-            y_pos  = 60 + idx * 28
-            color  = GREEN if str(idx + 1) == typed else WHITE
+            color = GREEN if str(idx + 1) == typed else WHITE
             cv2.putText(panel, label,
-                        (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+                        (20, 60 + idx * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 
         if len(audio_files) > MAX_VISIBLE:
             cv2.putText(panel,
@@ -216,7 +199,6 @@ def _ask_theme_in_window(person_name: str) -> str | None:
                         (20, 60 + MAX_VISIBLE * 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, GREY, 1)
 
-        # Caixa de input
         input_y = H - 100
         cv2.line(panel, (20, input_y - 10), (W - 20, input_y - 10), GREY, 1)
         cv2.putText(panel, "Numero: " + typed + "|",
@@ -227,27 +209,23 @@ def _ask_theme_in_window(person_name: str) -> str | None:
         cv2.imshow(WIN, panel)
         key = cv2.waitKey(30) & 0xFF
 
-        if key == 27:           # ESC → sem música
+        if key == 27:
             cv2.destroyWindow(WIN)
             return None
-
-        elif key == ord('r'):   # pedido ao admin
+        elif key == ord('r'):
             return _ask_music_request_in_window(WIN, person_name, W, H,
                                                 BG, CYAN, WHITE, GREY, YELLOW)
-
-        elif key == 8:          # BACKSPACE
+        elif key == 8:
             typed = typed[:-1]
-
-        elif 48 <= key <= 57:   # dígito 0-9
+        elif 48 <= key <= 57:
             typed += chr(key)
-
-        elif key == 13:         # ENTER — validar
+        elif key == 13:
             try:
                 choice = int(typed)
                 if 1 <= choice <= len(audio_files):
                     selected = audio_files[choice - 1]
                 else:
-                    typed = ""  # número fora de alcance — limpar
+                    typed = ""
             except ValueError:
                 typed = ""
 
@@ -257,10 +235,6 @@ def _ask_theme_in_window(person_name: str) -> str | None:
 
 def _ask_music_request_in_window(WIN, person_name, W, H,
                                   BG, CYAN, WHITE, GREY, YELLOW) -> str | None:
-    """
-    Sub-janela para o utilizador escrever o pedido de música.
-    Devolve ``"REQUEST:<texto>"`` ou None se cancelado.
-    """
     try:
         import cv2
         import numpy as np
@@ -269,8 +243,7 @@ def _ask_music_request_in_window(WIN, person_name, W, H,
 
     typed = ""
     while True:
-        panel = np.zeros((H, W, 3), dtype=np.uint8)
-        panel[:] = BG
+        panel = np.full((H, W, 3), BG, dtype=np.uint8)
 
         cv2.putText(panel, "Pedido de musica para o admin",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, CYAN, 2)
@@ -278,15 +251,12 @@ def _ask_music_request_in_window(WIN, person_name, W, H,
         cv2.putText(panel, "Escreve o nome da musica / artista:",
                     (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
 
-        # caixa de texto
         cv2.rectangle(panel, (16, 110), (W - 16, 150), (50, 50, 50), -1)
         cv2.rectangle(panel, (16, 110), (W - 16, 150), YELLOW, 1)
 
-        # wrap simples — mostra só os últimos 45 caracteres para não sair da caixa
         display_text = typed[-45:] if len(typed) > 45 else typed
         cv2.putText(panel, display_text + "|",
                     (22, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 1)
-
         cv2.putText(panel, "ENTER = enviar pedido  |  ESC = cancelar",
                     (20, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, GREY, 1)
 
@@ -300,25 +270,16 @@ def _ask_music_request_in_window(WIN, person_name, W, H,
             typed = typed[:-1]
         elif key == 13:
             cv2.destroyWindow(WIN)
-            if typed.strip():
-                return f"REQUEST:{typed.strip()}"
-            return None
+            return f"REQUEST:{typed.strip()}" if typed.strip() else None
         elif 32 <= key <= 126:
             typed += chr(key)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  API PÚBLICA — CHAMADA PELO registration.py
+#  API PÚBLICA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ask_and_save_theme(uid: int, person_name: str) -> None:
-    """
-    Pergunta ao utilizador se quer uma theme song e guarda a escolha.
-    Chamado no final do registo bem-sucedido, ainda dentro da
-    registration_thread (antes de limpar registration_busy).
-
-    Trata também dos pedidos: guarda-os em REQUESTS_FILE para o admin ver.
-    """
     result = _ask_theme_in_window(person_name)
 
     if result is None:
@@ -338,32 +299,21 @@ def ask_and_save_theme(uid: int, person_name: str) -> None:
         print(f"  [theme] Pedido guardado para o admin: '{request_text}'")
         return
 
-    # Ficheiro de áudio válido escolhido
     themes = _load_themes()
     themes[str(uid)] = result
     _save_themes(themes)
     print(f"  [theme] Theme song de '{person_name}' → {result}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  REPRODUÇÃO — CHAMADA PELO face_recognition.py
-# ══════════════════════════════════════════════════════════════════════════════
-
 def play_theme_for(uid: int) -> None:
     """
-    Toca a theme song do utilizador com o *uid* dado, numa thread separada,
-    se e só se:
-      - pygame estiver disponível,
-      - existir uma música associada a esse uid,
-      - o cooldown desde o último play tiver expirado.
-
-    Seguro para chamar em qualquer thread — usa lock interno.
-    Nunca lança excepção para o caller.
+    Play the theme for *uid* in a background thread, respecting PLAY_COOLDOWN.
+    Uses the in-memory cache so there is no disk I/O on the hot recognition path.
     """
     if not _PYGAME_OK:
         return
 
-    themes = _load_themes()
+    themes = _load_themes()          # O(1) cache hit in the common case
     path   = themes.get(str(uid))
     if not path or not os.path.exists(path):
         return
@@ -371,24 +321,18 @@ def play_theme_for(uid: int) -> None:
     with _play_lock:
         global _last_played_uid, _last_play_time
         now = time.time()
-
-        # Cooldown global: não tocar se já está a tocar ou se passou pouco tempo
         if (now - _last_play_time) < PLAY_COOLDOWN:
             return
-
         _last_played_uid = uid
         _last_play_time  = now
 
-    # Lança numa thread daemon para não bloquear o loop principal
     threading.Thread(target=_play_audio, args=(path,), daemon=True).start()
 
 
 def _play_audio(path: str) -> None:
-    """Worker que realmente toca o ficheiro. Corre numa thread separada."""
     try:
         pygame.mixer.music.load(path)
         pygame.mixer.music.play()
-        # Aguarda o fim da reprodução sem bloquear outras threads
         while pygame.mixer.music.get_busy():
             time.sleep(0.1)
     except Exception as e:
@@ -400,10 +344,6 @@ def _play_audio(path: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def list_music_requests() -> None:
-    """
-    Imprime todos os pedidos de música pendentes.
-    Chamado a partir do management_menu em face_recognition.py.
-    """
     requests = _load_requests()
     pending  = [r for r in requests if not r.get("done")]
 
@@ -418,9 +358,6 @@ def list_music_requests() -> None:
 
 
 def mark_request_done() -> None:
-    """
-    Permite ao admin marcar um pedido como resolvido (interactivo, no terminal).
-    """
     requests = _load_requests()
     pending  = [(i, r) for i, r in enumerate(requests) if not r.get("done")]
 

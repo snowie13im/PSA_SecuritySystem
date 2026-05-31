@@ -5,68 +5,103 @@ import shutil
 import time
 import threading
 import numpy as np
+import pyrealsense2 as rs
+import paho.mqtt.client as mqtt
 
-# Import shared constants and the cascade detector
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "psahorus-facerec")
+mqtt_client.connect("localhost", 1883)
+mqtt_client.loop_start()
+
 from config import (
     DATA_DIR, NAMES_FILE, MODEL_FILE,
     IMG_SIZE, CONFIDENCE_MAX, ALERT_COOLDOWN, FACE_SIZE_MIN,
     face_cascade,
 )
-
-# Import everything the main loop needs from the registration subsystem
 from registration import (
-    set_frame,              # write latest frame for the reg. thread to read
-    event_queue,            # queue to send unknown-face events
-    registration_busy,      # Event flag: True while a prompt is open
-    registration_thread,    # the background worker function
-    train_model,            # used after delete to retrain / remove model
+    set_frame,
+    event_queue,
+    registration_busy,
+    registration_thread,
+    train_model,
 )
 from theme_song import play_theme_for, list_music_requests, mark_request_done
 
+MAX_FACE_DEPTH = 2.0
+ANTISPOOFING_STD_MIN = 0.015
 
-#  PERSISTENCE HELPERS  (read-only from this module's perspective)
-#  registration.py owns all writes; face_recognition.py only reads names and the trained model.
+def _init_realsense():
+    """
+    Configura e arranca o pipeline RealSense para a L515.
+    Activa o stream RGB (1280x720 @ 30fps) e o stream de profundidade (640x480 @ 30fps).
+    Devolve (pipeline, align) onde align sincroniza os dois streams.
+    """
+    pipeline = rs.pipeline()
+    config   = rs.config()
+
+    # Stream RGB — frames de cor para deteção e reconhecimento
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    # Stream de profundidade — LiDAR da L515 (Z16 = 16-bit, milímetros)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
+    pipeline.start(config)
+
+    # align projeta o mapa de profundidade para o mesmo plano do RGB,
+    # para que depth_frame[y][x] corresponda ao mesmo pixel do color_frame[y][x].
+    align = rs.align(rs.stream.color)
+
+    return pipeline, align
+
+
+def _get_face_depth(depth_frame_aligned, x, y, w, h):
+    """
+    Calcula a profundidade mediana (metros) e o desvio padrão da ROI do rosto.
+    Usa a mediana em vez da média para ignorar pixels sem retorno LiDAR (valor 0).
+
+    Devolve (mediana_metros, std_metros).
+    """
+    # Converter depth_frame para array numpy (valores em milímetros)
+    depth_image = np.asanyarray(depth_frame_aligned.get_data()).astype(np.float32)
+    depth_image *= 0.00025   # depth scale da L515 (metros por unidade)
+
+    roi = depth_image[y:y+h, x:x+w]
+
+    # Ignorar pixels sem retorno (valor 0 = sem medição)
+    valid = roi[roi > 0]
+    if len(valid) == 0:
+        return None, None
+
+    return float(np.median(valid)), float(np.std(valid))
+
+#  PERSISTENCE HELPERS
 
 def load_names() -> dict:
-    """
-    Load the ID -> name mapping from NAMES_FILE.
-    Returns {} on first run (file does not exist yet). JSON keys are always strings; cast to int where needed.
-    """
     if os.path.exists(NAMES_FILE):
-        return json.load(open(NAMES_FILE, encoding="utf-8"))
+        # FIX: use 'with' so the file handle is always released
+        with open(NAMES_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
     return {}
 
 
 def _save_names(names: dict) -> None:
-    """Persist the ID ->name mapping — called only by the DATABASE management helpers."""
-    json.dump(names, open(NAMES_FILE, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    with open(NAMES_FILE, "w", encoding="utf-8") as fh:
+        json.dump(names, fh, ensure_ascii=False, indent=2)
 
 
 def _person_folder(uid) -> str:
-    """Return the image folder path for a given person ID, e.g. 'face_data/3'."""
     return os.path.join(DATA_DIR, str(uid))
 
 
 def load_or_train_model(names: dict):
-    """
-    Load the saved LBPH model from disk if it exists, otherwise train fresh.
-    Returns None if there is not enough data to train yet.
-    """
     if os.path.exists(MODEL_FILE) and names:
         rec = cv2.face.LBPHFaceRecognizer_create()
         rec.read(MODEL_FILE)
         return rec
     return train_model(names)
 
+
 #  DATABASE MANAGEMENT HELPERS
-#  Called from the management menu between camera sessions.
 
 def list_people() -> dict:
-    """
-    Print a formatted table of all registered people with ID and photo count.
-    Returns the names dict so the menu loop can chain calls if needed.
-    """
     names = load_names()
     if not names:
         print("\n  (no people registered)")
@@ -82,11 +117,6 @@ def list_people() -> dict:
 
 
 def delete_person() -> None:
-    """
-    Interactively remove one person from the database.
-    Asks for a name, confirms, deletes their image folder and JSON entry,
-    then retrains the model (or removes it if the DB is now empty).
-    """
     names = list_people()
     if not names:
         return
@@ -109,7 +139,6 @@ def delete_person() -> None:
     _save_names(names)
     shutil.rmtree(_person_folder(uid), ignore_errors=True)
 
-    # Retrain with remaining people, or remove the model if DB is now empty
     if names:
         train_model(names)
     elif os.path.exists(MODEL_FILE):
@@ -119,10 +148,6 @@ def delete_person() -> None:
 
 
 def delete_all() -> None:
-    """
-    Wipe the entire database (all images, names JSON, and trained model).
-    Requires explicit y/n confirmation to prevent accidents.
-    """
     if input("\n  Delete EVERYTHING? (y/n): ").strip().lower() != 'y':
         print("  Cancelled.")
         return
@@ -138,24 +163,15 @@ def delete_all() -> None:
 
 
 #  MANAGEMENT MENU
-#  Shown at startup and when the user presses M during live recognition.
 
 def management_menu() -> bool:
-    """
-    Display the main text menu and handle the user's choice.
-
-    Returns
-    -------
-    True  — user chose "Start camera".
-    False — user chose "Quit".
-    """
     options = {
         "1": "Start camera",
         "2": "List registered people",
         "3": "Delete a person",
         "4": "Delete everything",
-        "5": "Ver pedidos de musica",
-        "6": "Marcar pedido como resolvido",
+        "5": "Check Music requests",
+        "6": "Mark music request as done",
         "0": "Quit",
     }
     while True:
@@ -178,33 +194,38 @@ def management_menu() -> bool:
         else: print("  [!] Invalid option.")
 
 
-
 #  MAIN RECOGNITION LOOP
 
 def main() -> None:
-    # Show the menu first; exit immediately if the user chooses Quit.
     if not management_menu():
         return
 
-    print("\nStarting camera...")
-    cap = cv2.VideoCapture(0)   # 0 = default system webcam
-    if not cap.isOpened():
-        print("[ERROR] Cannot access webcam.")
+    print("\nStarting RealSense L515...")
+    try:
+        pipeline, align = _init_realsense()
+    except Exception as e:
+        print(f"[ERROR] Cannot access L515: {e}")
         return
+    
+    class RealSenseCap:
+        def read(self_inner):
+            try:
+                frames        = pipeline.wait_for_frames(timeout_ms=5000)
+                aligned       = align.process(frames)
+                color_frame   = aligned.get_color_frame()
+                if not color_frame:
+                    return False, None
+                return True, np.asanyarray(color_frame.get_data())
+            except Exception:
+                return False, None
 
-    names = load_names()
+    cap = RealSenseCap()
 
-    # One-element list so the registration thread can swap in a newly trained
-    # model and the main loop picks it up on the very next frame, with no
-    # globals and no extra locking needed.
+    names          = load_names()
     recogniser_ref = [load_or_train_model(names)]
+    alert_active   = False
+    alert_since    = 0.0
 
-    # Cooldown tracking — prevents the unknown-face alert from firing every frame
-    alert_active = False
-    alert_since  = 0.0
-
-    # Launch the registration subsystem as a background daemon thread.
-    # Daemon = automatically killed if the main thread exits unexpectedly.
     t_reg = threading.Thread(
         target=registration_thread,
         args=(cap, names, recogniser_ref),
@@ -214,26 +235,26 @@ def main() -> None:
 
     print("System active.  Q = quit  |  M = menu\n")
 
-    # ── Per-frame detection and recognition loop ────────────────────────────
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Camera read failed.")
+        # Ler frame RGB + profundidade alinhada
+        try:
+            frames        = pipeline.wait_for_frames(timeout_ms=5000)
+            aligned       = align.process(frames)
+            color_frame   = aligned.get_color_frame()
+            depth_frame   = aligned.get_depth_frame()
+        except Exception:
+            print("[ERROR] Failed to read from camera.")
             break
 
-        # Share the raw frame with the registration thread so it can keep
-        # the "camera pending" preview refreshed during a prompt.
+        if not color_frame or not depth_frame:
+            continue
+
+        frame = np.asanyarray(color_frame.get_data())
         set_frame(frame)
 
-        # Convert to grayscale; equalise histogram to improve detection under
-        # uneven lighting (backlight, dim rooms, etc.).
         gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray_eq = cv2.equalizeHist(gray)
 
-        # Detect frontal faces.
-        # scaleFactor=1.3  — pyramid downscale step between detection passes.
-        # minNeighbors=5   — minimum overlapping rectangles to confirm a face
-        #                    (higher = fewer false positives, may miss small faces).
         faces = face_cascade.detectMultiScale(
             gray_eq,
             scaleFactor=1.3,
@@ -241,38 +262,65 @@ def main() -> None:
             minSize=(FACE_SIZE_MIN, FACE_SIZE_MIN),
         )
 
-        # Snapshot the recogniser — the registration thread may replace it
-        # between frames; reading once per frame keeps this iteration consistent.
         recogniser = recogniser_ref[0]
 
         for (x, y, w, h) in faces:
-            # Crop from the un-equalised frame so prediction matches training
-            # image quality; normalise size to match what the model was trained on.
+            depth_m, depth_std = _get_face_depth(depth_frame, x, y, w, h)
+
+            if depth_m is None:
+                # Sem retorno LiDAR — ignorar este rosto
+                continue
+
+            if depth_m > MAX_FACE_DEPTH:
+                # Rosto demasiado longe
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (100, 100, 100), 1)
+                cv2.putText(frame, f"{depth_m:.1f}m — TOO FAR",
+                            (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
+                continue
+
+            # ── Anti-spoofing por profundidade ──────────────────────────────
+            # Uma fotografia impressa tem profundidade quase constante (std baixo).
+            # Um rosto real tem variação natural na superfície (std alto).
+            if depth_std < ANTISPOOFING_STD_MIN:
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 100, 255), 2)
+                cv2.putText(frame, "SPOOFING DETECTED",
+                            (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 100, 255), 2)
+                continue
+
             face_roi = cv2.resize(gray[y:y+h, x:x+w], IMG_SIZE)
 
             if recogniser is not None:
-                # LBPH predict() → (label_id, confidence_distance)
-                # Distance 0 = identical; larger = less similar.
                 label_id, confidence = recogniser.predict(face_roi)
                 recognised = confidence < CONFIDENCE_MAX
             else:
-                # No model yet — every face is unknown until someone registers
                 recognised = False
                 label_id   = -1
                 confidence = 999.0
 
             if recognised:
-                label        = names.get(str(label_id), "?")
-                color        = (0, 200, 0)    # green
-                alert_active = False          # reset so future unknowns alert again
-                play_theme_for(label_id)      # toca a theme song (non-blocking)
+                label        = names.get(str(label_id)) #, "?")
+                color        = (0, 200, 0)
+                alert_active = False
+                play_theme_for(label_id)
+
+                mqtt_client.publish("psahorus/facerec/resultado", json.dumps({
+                    "pessoa":    label,
+                    "confianca": int(100 - confidence),
+                    "acao":      "abrir",
+                    "coord":     {"x": int(x + w/2), "y": int(y + h/2)}
+                }))
+
             else:
                 label = "UNKNOWN"
-                color = (0, 0, 220)           # red
+                color = (0, 0, 220)
 
-                # Fire the registration alert — but only when:
-                #   1. No prompt is already open (registration_busy not set)
-                #   2. Enough cooldown time has elapsed since the last alert
+                mqtt_client.publish("psahorus/facerec/resultado", json.dumps({
+                    "pessoa":    "UNKNOWN",
+                    "confianca": 0,
+                    "acao":      "negar",
+                    "coord":     {"x": int(x + w/2), "y": int(y + h/2)}
+                }))
+
                 if not registration_busy.is_set():
                     now = time.time()
                     if not alert_active or (now - alert_since) > ALERT_COOLDOWN:
@@ -284,25 +332,19 @@ def main() -> None:
                             "roi":  gray[y:y+h, x:x+w].copy(),
                         })
 
-            # ── Bounding box ──────────────────────────────────────────────────
             cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
 
-            # ── Label with filled background for contrast ─────────────────────
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
             cv2.rectangle(frame, (x, y - th - 14), (x + tw + 8, y), color, -1)
             cv2.putText(frame, label, (x + 4, y - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-            # ── Match percentage for recognised faces ─────────────────────────
-            # LBPH distance → 0-100% score:
-            # distance 0  → 100% match  (perfect)
-            # distance 80 → 0% match    (at threshold boundary)
+            info = f"{depth_m:.2f}m"
             if recognised:
-                cv2.putText(frame, f"{int(100 - confidence)}% match",
-                            (x, y + h + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+                info += f"  {int(100 - confidence)}% match"
+            cv2.putText(frame, info, (x, y + h + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-        # ── HUD ───────────────────────────────────────────────────────────────
         cv2.putText(frame, "Q = quit  |  M = menu",
                     (10, frame.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
@@ -315,20 +357,20 @@ def main() -> None:
             break
 
         elif key == ord('m'):
-            # Pause the live feed, open the menu, then resume.
             cv2.destroyAllWindows()
             if not management_menu():
                 break
 
-            # Reload in case the user added/deleted people from the menu
             names = load_names()
             recogniser_ref[0] = load_or_train_model(names)
             alert_active = False
             print("\nCamera resumed.  Q = quit  |  M = menu\n")
 
-    # ── Clean shutdown ────────────────────────────────────────────────────────
-    event_queue.put({"type": "stop"})   # tell the registration thread to exit
-    t_reg.join(timeout=2)              # wait for it to finish gracefully
+    # Clean shutdown
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+    event_queue.put({"type": "stop"})
+    t_reg.join(timeout=2)
     cap.release()
     cv2.destroyAllWindows()
     print("Goodbye.")
